@@ -870,14 +870,21 @@ class VllmConfig:
                     f"cudagraph_mode={self.compilation_config.cudagraph_mode}"
                 )
 
-        if self.parallel_config.enable_dbo:
+        if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
-            assert a2a_backend in ["deepep_low_latency", "deepep_high_throughput"], (
-                "Microbatching currently only supports the deepep_low_latency and "
-                f"deepep_high_throughput all2all backend. {a2a_backend} is not "
-                "supported. To fix use --all2all-backend=deepep_low_latency or "
-                "--all2all-backend=deepep_high_throughput and install the DeepEP"
-                " kernels."
+            assert a2a_backend in [
+                "deepep_low_latency",
+                "deepep_high_throughput",
+            ], (
+                f"Dual Batch Overlap (DBO) / microbatching requires DeepEP kernels "
+                f"but '{a2a_backend}' all2all backend was specified. "
+                f"DBO overlaps computation and communication for MoE models, "
+                f"but currently only works with DeepEP backends. "
+                f"To fix, either:\n"
+                f"  1. Use --all2all-backend=deepep_low_latency or "
+                f"--all2all-backend=deepep_high_throughput (requires DeepEP), or\n"
+                f"  2. Disable DBO by not using --enable-dbo if you want "
+                f"to use the '{a2a_backend}' backend"
             )
 
             if not self.model_config.disable_cascade_attn:
@@ -887,17 +894,48 @@ class VllmConfig:
         if not self.instance_id:
             self.instance_id = random_uuid()[:5]
 
-        if not self.scheduler_config.disable_hybrid_kv_cache_manager:
-            # logger should only print warning message for hybrid models. As we
-            # can't know whether the model is hybrid or not now, so we don't log
-            # warning message here and will log it later.
-            if not current_platform.support_hybrid_kv_cache():
-                # Hybrid KV cache manager is not supported on non-GPU platforms.
-                self.scheduler_config.disable_hybrid_kv_cache_manager = True
+        # Hybrid KV cache manager (HMA) runtime rules:
+        # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
+        #   disables it
+        # - No preference: auto-disable for unsupported features (e.g. kv connector)
+        # - Explicit disable (--disable-kv-cache-manager): always respect it
+        need_disable_hybrid_kv_cache_manager = False
+        # logger should only print warning message for hybrid models. As we
+        # can't know whether the model is hybrid or not now, so we don't log
+        # warning message here and will log it later.
+        if not current_platform.support_hybrid_kv_cache():
+            # Hybrid KV cache manager is not supported on non-GPU platforms.
+            need_disable_hybrid_kv_cache_manager = True
+        if self.kv_events_config is not None:
+            # Hybrid KV cache manager is not compatible with KV events.
+            need_disable_hybrid_kv_cache_manager = True
+        if (
+            self.model_config is not None
+            and self.model_config.attention_chunk_size is not None
+        ):
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_eagle()
+            ):
+                # Hybrid KV cache manager is not yet supported with chunked
+                # local attention + eagle.
+                need_disable_hybrid_kv_cache_manager = True
+            elif not envs.VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE:
+                logger.warning(
+                    "There is a latency regression when using chunked local"
+                    " attention with the hybrid KV cache manager. Disabling"
+                    " it, by default. To enable it, set the environment "
+                    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE=1."
+                )
+                # Hybrid KV cache manager is not yet supported with chunked
+                # local attention.
+                need_disable_hybrid_kv_cache_manager = True
+
+        if self.scheduler_config.disable_hybrid_kv_cache_manager is None:
+            # Default to disable HMA, but only if the user didn't express a preference.
             if self.kv_transfer_config is not None:
-                # NOTE(Kuntai): turn HMA off for connector for now.
-                # TODO(Kuntai): have a more elegent solution to check and
-                # turn off HMA for connector that does not support HMA.
+                # NOTE(Kuntai): turn HMA off for connector unless specifically enabled.
+                need_disable_hybrid_kv_cache_manager = True
                 logger.warning(
                     "Turning off hybrid kv cache manager because "
                     "`--kv-transfer-config` is set. This will reduce the "
@@ -905,33 +943,26 @@ class VllmConfig:
                     "or Mamba attention. If you are a developer of kv connector"
                     ", please consider supporting hybrid kv cache manager for "
                     "your connector by making sure your connector is a subclass"
-                    " of `SupportsHMA` defined in kv_connector/v1/base.py."
+                    " of `SupportsHMA` defined in kv_connector/v1/base.py and"
+                    " use --no-disable-hybrid-kv-cache-manager to start vLLM."
                 )
-                self.scheduler_config.disable_hybrid_kv_cache_manager = True
-            if self.kv_events_config is not None:
-                # Hybrid KV cache manager is not compatible with KV events.
-                self.scheduler_config.disable_hybrid_kv_cache_manager = True
-            if (
-                self.model_config is not None
-                and self.model_config.attention_chunk_size is not None
-            ):
-                if (
-                    self.speculative_config is not None
-                    and self.speculative_config.use_eagle()
-                ):
-                    # Hybrid KV cache manager is not yet supported with chunked
-                    # local attention + eagle.
-                    self.scheduler_config.disable_hybrid_kv_cache_manager = True
-                elif not envs.VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE:
-                    logger.warning(
-                        "There is a latency regression when using chunked local"
-                        " attention with the hybrid KV cache manager. Disabling"
-                        " it, by default. To enable it, set the environment "
-                        "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE=1."
-                    )
-                    # Hybrid KV cache manager is not yet supported with chunked
-                    # local attention.
-                    self.scheduler_config.disable_hybrid_kv_cache_manager = True
+            self.scheduler_config.disable_hybrid_kv_cache_manager = (
+                need_disable_hybrid_kv_cache_manager
+            )
+        elif (
+            self.scheduler_config.disable_hybrid_kv_cache_manager is False
+            and need_disable_hybrid_kv_cache_manager
+        ):
+            raise ValueError(
+                "Hybrid KV cache manager was explicitly enabled but is not "
+                "supported in this configuration. Consider omitting the "
+                "--no-disable-hybrid-kv-cache-manager flag to let vLLM decide"
+                " automatically."
+            )
+
+        if self.scheduler_config.disable_hybrid_kv_cache_manager is None:
+            # Default to enable HMA if not explicitly disabled by user or logic above.
+            self.scheduler_config.disable_hybrid_kv_cache_manager = False
 
         if self.compilation_config.debug_dump_path:
             self.compilation_config.debug_dump_path = (
@@ -1333,6 +1364,11 @@ def set_current_vllm_config(
 
     num_models_seen = compilation_counter.num_models_seen
     try:
+        # Clear the compilation config cache when context changes.
+        # This is needed since the old config may have been accessed
+        # and cached before the new config is set.
+        get_cached_compilation_config.cache_clear()
+
         _current_vllm_config = vllm_config
         _current_prefix = prefix
         yield
