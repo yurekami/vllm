@@ -5,7 +5,7 @@ import torch
 
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+from vllm.utils.flashinfer import (
     calculate_tile_tokens_dim,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (

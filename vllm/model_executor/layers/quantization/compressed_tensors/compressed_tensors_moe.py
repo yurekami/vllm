@@ -58,7 +58,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     reorder_w1w3_to_w3w1,
     select_nvfp4_gemm_impl,
 )
-from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+from vllm.utils.flashinfer import (
     FlashinferMoeBackend,
     get_flashinfer_moe_backend,
 )

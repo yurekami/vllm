@@ -12,7 +12,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     fp8_w8a8_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
-from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+from vllm.utils.flashinfer import (
     apply_flashinfer_per_tensor_scale_fp8,
     flashinfer_cutlass_moe_fp8,
     register_moe_scaling_factors,
