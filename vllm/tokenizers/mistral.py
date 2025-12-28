@@ -226,12 +226,19 @@ class MistralTokenizer(TokenizerLike):
                 MistralCommonTokenizer as MistralCommonBackend,
             )
 
+        # Only set revision="main" for remote repos, not for local paths
+        # Local paths don't have revisions and setting one can cause errors
+        is_local_path = Path(path_or_repo_id).exists()
+        resolved_revision = revision
+        if revision is None and not is_local_path:
+            resolved_revision = "main"
+
         tokenizer = MistralCommonBackend.from_pretrained(
             path_or_repo_id,
             *args,
             mode=ValidationMode.test,
             cache_dir=download_dir,
-            revision="main" if revision is None else revision,
+            revision=resolved_revision,
             **kwargs,
         )
 
