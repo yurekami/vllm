@@ -2,20 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Literal
 
 from pydantic import Field, SkipValidation, field_validator
 from pydantic.dataclasses import dataclass
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.utils.mem_constants import GiB_bytes
-from vllm.utils.mem_utils import get_cpu_memory
-
-if TYPE_CHECKING:
-    from vllm.config.parallel import ParallelConfig
-else:
-    ParallelConfig = Any
 
 logger = init_logger(__name__)
 
@@ -54,8 +47,6 @@ class CacheConfig:
     not matter if you have another vLLM instance running on the same GPU. For
     example, if you have two vLLM instances running on the same GPU, you can
     set the GPU memory utilization to 0.5 for each instance."""
-    swap_space: float = Field(default=4, ge=0)
-    """Size of the CPU swap space per GPU (in GiB)."""
     cache_dtype: CacheDType = "auto"
     """Data type for kv cache storage. If "auto", will use model data type.
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
@@ -174,7 +165,6 @@ class CacheConfig:
         ignored_factors = {
             # Runtime/derived knobs that don't affect compiled graph shape
             "gpu_memory_utilization",
-            "swap_space",
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",
@@ -209,24 +199,3 @@ class CacheConfig:
                 "scaling factor."
             )
         return cache_dtype
-
-    def verify_with_parallel_config(
-        self,
-        parallel_config: ParallelConfig,
-    ) -> None:
-        swap_space_bytes = self.swap_space * GiB_bytes
-        total_cpu_memory = get_cpu_memory()
-        # FIXME(woosuk): Here, it is assumed that the GPUs in a tensor parallel
-        # group are in the same node. However, the GPUs may span multiple nodes.
-        num_gpus_per_node = parallel_config.tensor_parallel_size
-        cpu_memory_usage = swap_space_bytes * num_gpus_per_node
-
-        msg = (
-            f"{cpu_memory_usage / GiB_bytes:.2f} GiB out of the "
-            f"{total_cpu_memory / GiB_bytes:.2f} GiB total CPU memory "
-            "is allocated for the swap space."
-        )
-        if cpu_memory_usage > 0.7 * total_cpu_memory:
-            raise ValueError("Too large swap space. " + msg)
-        elif cpu_memory_usage > 0.4 * total_cpu_memory:
-            logger.warning("Possibly too large swap space. %s", msg)
