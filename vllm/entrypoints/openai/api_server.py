@@ -91,6 +91,7 @@ from vllm.entrypoints.utils import (
     with_cancellation,
 )
 from vllm.logger import init_logger
+from vllm.logging_utils import AccessLogPathFilter
 from vllm.reasoning import ReasoningParserManager
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -1353,6 +1354,19 @@ async def run_server_worker(
             engine_client.vllm_config.parallel_config._api_process_rank,
             listen_address,
         )
+
+        # Apply access log path filter if specified
+        if args.uvicorn_access_log_path_filter:
+            import logging as std_logging
+
+            uvicorn_access_logger = std_logging.getLogger("uvicorn.access")
+            path_filter = AccessLogPathFilter(args.uvicorn_access_log_path_filter)
+            uvicorn_access_logger.addFilter(path_filter)
+            logger.info(
+                "Filtering access logs for paths: %s",
+                args.uvicorn_access_log_path_filter,
+            )
+
         shutdown_task = await serve_http(
             app,
             sock=sock,

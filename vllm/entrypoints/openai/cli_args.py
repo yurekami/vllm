@@ -85,6 +85,9 @@ class FrontendArgs:
     """Log level for uvicorn."""
     disable_uvicorn_access_log: bool = False
     """Disable uvicorn access log."""
+    uvicorn_access_log_path_filter: list[str] | None = None
+    """Comma-separated list of URL paths to exclude from uvicorn access logs.
+    Example: '/metrics,/health' to filter out metrics and health check logs."""
     allow_credentials: bool = False
     """Allow credentials."""
     allowed_origins: list[str] = field(default_factory=lambda: ["*"])
@@ -236,6 +239,16 @@ class FrontendArgs:
         if "nargs" in frontend_kwargs["middleware"]:
             del frontend_kwargs["middleware"]["nargs"]
         frontend_kwargs["middleware"]["default"] = []
+
+        # Special case: uvicorn_access_log_path_filter is comma-separated
+        def parse_path_filter(value: str) -> list[str]:
+            if not value:
+                return []
+            return [p.strip() for p in value.split(",") if p.strip()]
+
+        frontend_kwargs["uvicorn_access_log_path_filter"]["type"] = parse_path_filter
+        if "nargs" in frontend_kwargs["uvicorn_access_log_path_filter"]:
+            del frontend_kwargs["uvicorn_access_log_path_filter"]["nargs"]
 
         # Special case: Tool call parser shows built-in options.
         valid_tool_parsers = list(ToolParserManager.list_registered())

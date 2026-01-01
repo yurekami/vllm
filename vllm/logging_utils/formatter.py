@@ -125,3 +125,34 @@ class ColoredFormatter(NewLineFormatter):
         record.levelname = orig_levelname
 
         return msg
+
+
+class AccessLogPathFilter(logging.Filter):
+    """Filter that excludes access log entries for specified URL paths.
+
+    This filter examines uvicorn access log messages and filters out
+    entries matching any of the specified paths. Useful for reducing
+    log noise from high-frequency endpoints like /metrics or /health.
+    """
+
+    def __init__(self, excluded_paths: list[str] | None = None):
+        super().__init__()
+        self.excluded_paths = excluded_paths or []
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self.excluded_paths:
+            return True
+
+        # Uvicorn access logs have the format:
+        # '<ip> - "<method> <path> HTTP/<version>" <status>'
+        # We need to extract the path from the message
+        message = record.getMessage()
+        for path in self.excluded_paths:
+            # Check if the path appears in the log message
+            # Handle both exact path and path with query strings
+            if f'"{path} ' in message or f'"{path}?' in message:
+                return False
+            # Also handle paths without method prefix (e.g., just the path part)
+            if f' {path} HTTP' in message or f' {path}? HTTP' in message:
+                return False
+        return True

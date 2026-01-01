@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import logging
 
 import pytest
 
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.serving_models import LoRAModulePath
+from vllm.logging_utils import AccessLogPathFilter
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from ...utils import VLLM_PATH
@@ -241,3 +243,119 @@ def test_default_chat_template_kwargs_invalid_json(serve_parser):
         serve_parser.parse_args(
             args=["--default-chat-template-kwargs", "not valid json"]
         )
+
+
+### Tests for uvicorn_access_log_path_filter argument
+def test_access_log_path_filter_single_path(serve_parser):
+    """Test parsing a single path for access log filtering"""
+    args = serve_parser.parse_args(
+        args=["--uvicorn-access-log-path-filter", "/metrics"]
+    )
+    assert args.uvicorn_access_log_path_filter == ["/metrics"]
+
+
+def test_access_log_path_filter_multiple_paths(serve_parser):
+    """Test parsing multiple comma-separated paths for access log filtering"""
+    args = serve_parser.parse_args(
+        args=["--uvicorn-access-log-path-filter", "/metrics,/health,/ready"]
+    )
+    assert args.uvicorn_access_log_path_filter == ["/metrics", "/health", "/ready"]
+
+
+def test_access_log_path_filter_with_spaces(serve_parser):
+    """Test that spaces around commas are handled correctly"""
+    args = serve_parser.parse_args(
+        args=["--uvicorn-access-log-path-filter", "/metrics , /health , /ready"]
+    )
+    assert args.uvicorn_access_log_path_filter == ["/metrics", "/health", "/ready"]
+
+
+def test_access_log_path_filter_default_none(serve_parser):
+    """Test that default value is None when not specified"""
+    args = serve_parser.parse_args(args=[])
+    assert args.uvicorn_access_log_path_filter is None
+
+
+def test_access_log_path_filter_empty_string(serve_parser):
+    """Test that empty string results in empty list"""
+    args = serve_parser.parse_args(
+        args=["--uvicorn-access-log-path-filter", ""]
+    )
+    assert args.uvicorn_access_log_path_filter == []
+
+
+### Tests for AccessLogPathFilter class
+class TestAccessLogPathFilter:
+    """Tests for the AccessLogPathFilter logging filter"""
+
+    def _create_log_record(self, message: str) -> logging.LogRecord:
+        """Helper to create a mock log record with a specific message"""
+        record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg=message,
+            args=(),
+            exc_info=None,
+        )
+        return record
+
+    def test_filter_allows_when_no_excluded_paths(self):
+        """Test that filter allows all logs when no paths are excluded"""
+        filter_ = AccessLogPathFilter()
+        record = self._create_log_record(
+            '127.0.0.1 - "GET /metrics HTTP/1.1" 200'
+        )
+        assert filter_.filter(record) is True
+
+    def test_filter_blocks_metrics_path(self):
+        """Test that filter blocks /metrics endpoint logs"""
+        filter_ = AccessLogPathFilter(["/metrics"])
+        record = self._create_log_record(
+            '127.0.0.1 - "GET /metrics HTTP/1.1" 200'
+        )
+        assert filter_.filter(record) is False
+
+    def test_filter_blocks_health_path(self):
+        """Test that filter blocks /health endpoint logs"""
+        filter_ = AccessLogPathFilter(["/health"])
+        record = self._create_log_record(
+            '127.0.0.1 - "GET /health HTTP/1.1" 200'
+        )
+        assert filter_.filter(record) is False
+
+    def test_filter_allows_non_excluded_paths(self):
+        """Test that filter allows logs for non-excluded paths"""
+        filter_ = AccessLogPathFilter(["/metrics", "/health"])
+        record = self._create_log_record(
+            '127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200'
+        )
+        assert filter_.filter(record) is True
+
+    def test_filter_blocks_multiple_excluded_paths(self):
+        """Test that filter blocks all excluded paths"""
+        filter_ = AccessLogPathFilter(["/metrics", "/health", "/ready"])
+
+        # Test each excluded path
+        for path in ["/metrics", "/health", "/ready"]:
+            record = self._create_log_record(
+                f'127.0.0.1 - "GET {path} HTTP/1.1" 200'
+            )
+            assert filter_.filter(record) is False
+
+    def test_filter_handles_path_with_query_string(self):
+        """Test that filter blocks paths with query strings"""
+        filter_ = AccessLogPathFilter(["/metrics"])
+        record = self._create_log_record(
+            '127.0.0.1 - "GET /metrics?format=json HTTP/1.1" 200'
+        )
+        assert filter_.filter(record) is False
+
+    def test_filter_with_empty_excluded_paths(self):
+        """Test that filter allows all logs when excluded_paths is empty"""
+        filter_ = AccessLogPathFilter([])
+        record = self._create_log_record(
+            '127.0.0.1 - "GET /metrics HTTP/1.1" 200'
+        )
+        assert filter_.filter(record) is True
