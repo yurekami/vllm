@@ -24,6 +24,8 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_m
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     prepare_moe_fp8_layer_for_marlin,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
+from vllm.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_BLOCK_SIZE,
     OCP_MX_Scheme,
@@ -704,6 +706,63 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
     def process_weights_after_loading(self, layer):
         if self.emulate:
+            # Dequantize weights at load time for emulation mode.
+            # This avoids runtime dequantization overhead in fused_experts.
+            out_dtype = torch.get_default_dtype()
+
+            if self.ocp_mx_scheme in {
+                OCP_MX_Scheme.w_mxfp4_a_mxfp4,
+                OCP_MX_Scheme.w_mxfp4_a_mxfp6_e3m2,
+                OCP_MX_Scheme.w_mxfp4_a_mxfp6_e2m3,
+            }:
+                # Dequantize MXFP4 weights
+                w13_dequant = dequant_mxfp4(
+                    layer.w13_weight, layer.w13_weight_scale, out_dtype
+                )
+                w2_dequant = dequant_mxfp4(
+                    layer.w2_weight, layer.w2_weight_scale, out_dtype
+                )
+            elif self.ocp_mx_scheme == OCP_MX_Scheme.w_mxfp6_e3m2_a_mxfp6_e3m2:
+                # Dequantize MXFP6 e3m2 weights
+                w13_dequant = dequant_mxfp6(
+                    layer.w13_weight,
+                    layer.w13_weight_scale,
+                    quant_dtype="fp6_e3m2",
+                    float_dtype=out_dtype,
+                )
+                w2_dequant = dequant_mxfp6(
+                    layer.w2_weight,
+                    layer.w2_weight_scale,
+                    quant_dtype="fp6_e3m2",
+                    float_dtype=out_dtype,
+                )
+            elif self.ocp_mx_scheme == OCP_MX_Scheme.w_mxfp6_e2m3_a_mxfp6_e2m3:
+                # Dequantize MXFP6 e2m3 weights
+                w13_dequant = dequant_mxfp6(
+                    layer.w13_weight,
+                    layer.w13_weight_scale,
+                    quant_dtype="fp6_e2m3",
+                    float_dtype=out_dtype,
+                )
+                w2_dequant = dequant_mxfp6(
+                    layer.w2_weight,
+                    layer.w2_weight_scale,
+                    quant_dtype="fp6_e2m3",
+                    float_dtype=out_dtype,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Unsupported ocp_mx_scheme={self.ocp_mx_scheme}"
+                )
+
+            # Replace quantized weights with dequantized ones
+            layer.w13_weight = torch.nn.Parameter(w13_dequant, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(w2_dequant, requires_grad=False)
+            # Clear scales as they are no longer needed
+            layer.w13_weight_scale = None
+            layer.w2_weight_scale = None
+
+            torch.cuda.empty_cache()
             return
 
         from aiter.utility.fp4_utils import e8m0_shuffle
@@ -734,6 +793,10 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
+        if self.emulate:
+            # Weights are already dequantized in process_weights_after_loading,
+            # so no quantization config is needed.
+            return None
         return ocp_mx_moe_quant_config(
             quant_dtype=self.input_dtype,
             weight_dtype=self.weight_dtype,
