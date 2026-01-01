@@ -1860,10 +1860,20 @@ def fused_experts_impl(
     if global_num_experts == -1:
         global_num_experts = E
     top_k_num = topk_ids.size(1)
-    # We execute the fused_moe kernel in chunks to circumvent this issue:
-    # https://github.com/vllm-project/vllm/issues/5938
+    # Note: The fused_moe kernel has a maximum token limit due to Triton
+    # indexing constraints. With chunked prefill enabled (the default),
+    # this limit should never be exceeded. If you see this error, ensure
+    # chunked prefill is enabled or reduce your batch size.
+    # See: https://github.com/vllm-project/vllm/issues/5938
     CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
-    M = min(num_tokens, CHUNK_SIZE)
+    if num_tokens > CHUNK_SIZE:
+        raise ValueError(
+            f"Number of tokens ({num_tokens}) exceeds the maximum supported "
+            f"by fused_moe kernel ({CHUNK_SIZE}). This typically indicates "
+            "chunked prefill is disabled. Enable chunked prefill or reduce "
+            "your batch size to avoid this error."
+        )
+    M = num_tokens
 
     config_dtype = _get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
@@ -1956,134 +1966,109 @@ def fused_experts_impl(
         else:
             raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
 
-    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
-        begin_chunk_idx, end_chunk_idx = (
-            chunk * CHUNK_SIZE,
-            min((chunk + 1) * CHUNK_SIZE, num_tokens),
+    qhidden_states, a1q_scale = moe_kernel_quantize_input(
+        A=hidden_states,
+        A_scale=a1_scale,
+        quant_dtype=quant_dtype,
+        per_act_token_quant=per_channel_quant,
+        block_shape=block_shape,
+    )
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids,
+        config["BLOCK_SIZE_M"],
+        global_num_experts,
+        expert_map,
+        ignore_invalid_experts=True,
+    )
+
+    invoke_fused_moe_kernel(
+        qhidden_states,
+        w1,
+        intermediate_cache1,
+        a1q_scale,
+        w1_scale,
+        w1_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        apply_router_weight_on_input,
+        top_k_num,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+        B_bias=w1_bias,
+    )
+
+    # Activation function with multiplication
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(
+            intermediate_cache2, intermediate_cache1.view(-1, N)
         )
-        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
-        tokens_in_chunk, _ = curr_hidden_states.size()
-
-        if tokens_in_chunk == 0:
-            break
-
-        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
-            # Adjust the intermediate cache size and config for the last
-            # chunk. Note that in most cases we only have one chunk
-            # so the cache size and config are already set correctly and
-            # do not need to be adjusted.
-            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[
-                : tokens_in_chunk * topk_ids.size(1)
-            ]
-            intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
-            config = get_config_func(tokens_in_chunk)
-
-        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
-        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
-        qcurr_hidden_states, a1q_scale = moe_kernel_quantize_input(
-            A=curr_hidden_states,
-            A_scale=a1_scale,
-            quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
+    elif activation == "gelu":
+        torch.ops._C.gelu_and_mul(
+            intermediate_cache2, intermediate_cache1.view(-1, N)
         )
-
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            curr_topk_ids,
-            config["BLOCK_SIZE_M"],
-            global_num_experts,
-            expert_map,
-            ignore_invalid_experts=True,
+    elif activation == "swigluoai":
+        # alpha = 1.702, limit = 7.0
+        torch.ops._C.swigluoai_and_mul(
+            intermediate_cache2, intermediate_cache1.view(-1, N)
         )
+    # Activation function without multiplication
+    elif activation == SILU_NO_MUL:
+        intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
+    elif activation == GELU_NO_MUL:
+        intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
+    elif activation == RELU2_NO_MUL:
+        intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
 
-        invoke_fused_moe_kernel(
-            qcurr_hidden_states,
-            w1,
-            intermediate_cache1,
-            a1q_scale,
-            w1_scale,
-            w1_zp,
-            curr_topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            top_k_num,
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            B_bias=w1_bias,
-        )
+    qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+        A=intermediate_cache2,
+        A_scale=a2_scale,
+        quant_dtype=quant_dtype,
+        per_act_token_quant=per_channel_quant,
+        block_shape=block_shape,
+    )
 
-        # Activation function with multiplication
-        if activation == "silu":
-            torch.ops._C.silu_and_mul(
-                intermediate_cache2, intermediate_cache1.view(-1, N)
-            )
-        elif activation == "gelu":
-            torch.ops._C.gelu_and_mul(
-                intermediate_cache2, intermediate_cache1.view(-1, N)
-            )
-        elif activation == "swigluoai":
-            # alpha = 1.702, limit = 7.0
-            torch.ops._C.swigluoai_and_mul(
-                intermediate_cache2, intermediate_cache1.view(-1, N)
-            )
-        # Activation function without multiplication
-        elif activation == SILU_NO_MUL:
-            intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
-        elif activation == GELU_NO_MUL:
-            intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
-        elif activation == RELU2_NO_MUL:
-            intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
-        else:
-            raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
+    if expert_map is not None:
+        intermediate_cache3.zero_()
 
-        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-            A=intermediate_cache2,
-            A_scale=a2_scale,
-            quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
-        )
+    invoke_fused_moe_kernel(
+        qintermediate_cache2,
+        w2,
+        intermediate_cache3,
+        a2q_scale,
+        w2_scale,
+        w2_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        not apply_router_weight_on_input,
+        1,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+        B_bias=w2_bias,
+    )
 
-        if expert_map is not None:
-            intermediate_cache3.zero_()
-
-        invoke_fused_moe_kernel(
-            qintermediate_cache2,
-            w2,
-            intermediate_cache3,
-            a2q_scale,
-            w2_scale,
-            w2_zp,
-            curr_topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            1,
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            B_bias=w2_bias,
-        )
-
-        ops.moe_sum(
-            intermediate_cache3.view(*intermediate_cache3.size()),
-            out_hidden_states[begin_chunk_idx:end_chunk_idx],
-        )
+    ops.moe_sum(
+        intermediate_cache3.view(*intermediate_cache3.size()),
+        out_hidden_states,
+    )
 
     return out_hidden_states
 
