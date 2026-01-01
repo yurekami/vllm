@@ -61,8 +61,11 @@ class EPLBConfig:
     of the last `lb_window_size` steps will be used for rearranging experts.
     """
 
-    num_redundant_experts: int = Field(default=0, ge=0)
-    """Number of redundant experts to use for expert parallelism."""
+    num_redundant_experts: int = Field(default=-1, ge=-1)
+    """Number of redundant experts to use for expert parallelism.
+    Set to -1 (default) for auto-calculation based on EP size and number of
+    logical experts. Set to 0 to disable redundancy, or a positive value
+    to specify the exact number of redundant experts."""
 
     log_balancedness: bool = False
     """
@@ -76,6 +79,26 @@ class EPLBConfig:
 
     policy: EPLBPolicyOption = "default"
     """The policy type for expert parallel load balancing (EPLB)."""
+
+    def get_num_redundant_experts(
+        self, num_logical_experts: int, ep_size: int
+    ) -> int:
+        """Get the number of redundant experts, auto-calculating if needed.
+
+        Args:
+            num_logical_experts: Number of logical experts in the model.
+            ep_size: Expert parallelism world size.
+
+        Returns:
+            The number of redundant experts to use. If num_redundant_experts
+            is -1 (auto), returns max(0, ep_size - num_logical_experts) to
+            ensure at least one expert per EP rank when possible.
+        """
+        if self.num_redundant_experts == -1:
+            # Auto-calculate: ensure we have at least ep_size physical experts
+            # so each EP rank has at least one expert
+            return max(0, ep_size - num_logical_experts)
+        return self.num_redundant_experts
 
 
 @config
@@ -309,12 +332,15 @@ class ParallelConfig:
                     f"TP={self.tensor_parallel_size},DP={self.data_parallel_size}."
                 )
         else:
-            if self.eplb_config.num_redundant_experts != 0:
+            # When EPLB is not enabled, num_redundant_experts must be either:
+            # - -1 (auto, which means no redundancy when EPLB is disabled)
+            # - 0 (explicit no redundancy)
+            if self.eplb_config.num_redundant_experts > 0:
                 raise ValueError(
                     "num_redundant_experts is set to "
                     f"{self.eplb_config.num_redundant_experts} but EPLB is not "
-                    "enabled. Either enable EPLB or unset "
-                    "num_redundant_experts."
+                    "enabled. Either enable EPLB or set "
+                    "num_redundant_experts to 0 or -1 (auto)."
                 )
 
         return self
